@@ -20,10 +20,11 @@ Amazon-Recommendation-System/
 │  ├─ Reviews.csv
 │  └─ feature_engineered_reviews.pkl
 ├─ src/
-│  ├─ feature_engineering.py
+│  ├─ bert_encoder.py
+│  ├─ evaluation.py
+|  ├─ feature_engineering.py
 │  ├─ ncf_model.py
-│  ├─ svm_model.py
-│  └─ sentiment.py
+│  └─ svm_model.py
 ├─ .gitignore
 ├─ README.md
 └─ requirements.txt

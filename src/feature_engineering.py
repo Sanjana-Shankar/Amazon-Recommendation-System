@@ -7,10 +7,17 @@ from datetime import datetime
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from transformers import AutoTokenizer, AutoModel
 import torch
+from tqdm import tqdm
+from sentence_transformers import SentenceTransformer
+import pickle
+
+vader = SentimentIntensityAnalyzer()
 
 # Load BERT model once globally (faster
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 bert_model = AutoModel.from_pretrained("bert-base-uncased")
+
+model = SentenceTransformer("paraphrase-MiniLM-L6-v2")
 
 # Feature engineering pipeline 
 
@@ -76,94 +83,70 @@ def add_user_product_features(df):
     return df
 
 # Sentiment Features (VADER)
-
-def sentiment_score(text):
-    analyzer = SentimentIntensityAnalyzer()
-    try:
-        score = analyzer.polarity_scores(text)["compound"]
-        print(f"Sentiment score: {score}")
-        return score
-    except:
-        print("Sentiment score: 0.0")
-        return 0.0
     
 def add_sentiment_features(df):
-    df["sentiment_review"] = df["reviewText"].apply(sentiment_score)
-    print("Sentiment review")
-    df["sentiment_summary"] = df["summary"].apply(sentiment_score)
-    print("Sentiment summary")
-    return df
+    
+    print("Computing VADER sentiment...")
 
-# Text Features from Reviews turn them into encodings for review input (BERT)
-def compute_bert_embedding(text):
-    # Return the 768-dim BERT embedding for one text input
-    if not isinstance(text, str) or len(text.strip()) == 0:
-        return np.zeros(768)
-    inputs = tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=128, # keeps runtime reasonable
-        padding="max_length"
-    )
-    with torch.no_grad():
-        outputs = bert_model(**inputs)
-    # CLS token embedding = outputs.last_hidden_state[:,0,:]
-    cls_embedding = outputs.last_hidden_state[:,0,:].squeeze().numpy()
-    return cls_embedding 
-
-def add_bert_features(df):
-    # 768-dimensional BERT embeddings 
-    # Adds columns: bert_0 ..... bert 767
-    print("Generating BERT embeddings for reviewText...")
-
-    bert_embeddings = df["reviewText"].apply(compute_bert_embedding)
-
-    # Convert list of arrays -> 2D matrix 
-    bert_matrix = np.vstack(bert_embeddings.values)
-
-    bert_df = pd.DataFrame(
-        bert_matrix,
-        columns = [f"bert_{i}" for i in range (bert_matrix.shape[1])]
+    df["sentiment_review"] = df["reviewText"].fillna("").apply(
+        lambda t: vader.polarity_scores(t)["compound"]
     )
 
-    print("BERT embeddings shape:", bert_df.shape)
-
-    df = pd.concat([df.reset_index(drop=True), bert_df], axis=1)
-    return df
-
-'''
-def add_tfidf_features(df, max_features=5000):
-    vectorizer = TfidfVectorizer(max_features=max_features, stop_words="english")
-    print(f"Vectorizer {vectorizer}")
-    tfidf_matrix = vectorizer.fit_transform(df["reviewText"])
-    print(f"TF-IDF matrix {tfidf_matrix}")
-
-    tfidf_df = pd.DataFrame(
-        tfidf_matrix.toarray(),
-        columns=[f"tfidf_{i}" for i in range(tfidf_matrix.shape[1])]
+    df["sentiment_summary"] = df["summary"].fillna("").apply(
+        lambda t: vader.polarity_scores(t)["compound"]
     )
-    print(f"TF-IDF {tfidf_df}")
-    df = pd.concat([df.reset_index(drop=True), tfidf_df], axis=1)
     return df
-'''
+
+# Text Features from Reviews turn them into encodings for review input (MiniLM)
+def compute_miniLM_embedding(text_list, batch_size=32):
+    # Return the MiniLM embedding for large batches keeping consistent outputs while improving the speed
+    print("Generating fast MiniLM embeddings...")
+    embeddings = model.encode(
+        text_list,
+        batch_size=batch_size,
+        show_progress_bar=True,
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    )
+    return embeddings.astype("float32")
+
+def add_miniLM_features(df, batch_size=32):
+    # Adds miniLM embeddings to the dataframe, using batched encoding
+    
+    texts = df["reviewText"].fillna("").tolist()
+
+    print("Running batched MiniLM embedding generation...")
+    
+    embeddings = compute_miniLM_embedding(df["reviewText"].tolist())
+    print("Final MiniLM embedding shape:", embeddings.shape)
+    np.save("../data/review_embeddings.npy", embeddings)
+    print("Saved embeddings to ../data/review_embeddings.npy")
+    
+    # Add a column indicating the embedding file
+    df["bert_embedding_file"] = "../data/review_embeddings.npy"
+    return df
 
 # Category Encoding 
 def add_category_features(df):
-    if "category" not in df.columns:
-        print("No category column found - skipping one-hot encoding.")
+    if "rating" not in df.columns:
+        print("No rating column found — skipping one-hot encoding.")
         return df
-    enc = OneHotEncoder(handle_unknown="ignore", sparse=False)
+    
+    enc = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
     print(f"Encoder {enc}")
-    category_encoded = enc.fit_transform(df[["category"]])
-    print(f"Category encoded {category_encoded}")
-
-    cat_df = pd.DataFrame(category_encoded, columns=enc.get_feature_names_out(["category"]))
-    print(f"Cat df: {cat_df}")
-    df = pd.concat([df.reset_index(drop=True), cat_df], axis=1)
+    rating_encoded = enc.fit_transform(df[["rating"]])
+    print(f"Rating encoded {rating_encoded}")
+    
+    rating_df = pd.DataFrame(
+        rating_encoded,
+        columns=enc.get_feature_names_out(["rating"])
+    )
+    print(f"Rating df: {rating_df}")
+    
+    df = pd.concat([df.reset_index(drop=True), rating_df], axis=1)
     print(f"df: {df}")
     return df
-
+    
 # Rating Normalization 
 def normalize_rating(df):
     df["normalized_rating"] = (df["rating"]-1) / 4
@@ -180,7 +163,7 @@ def feature_engineering_pipeline(path):
     df = add_sentiment_features(df)
 
     # BERT features
-    df = add_bert_features(df)
+    df = add_miniLM_features(df)
 
     df = add_category_features(df)
     df = normalize_rating(df)
@@ -191,6 +174,11 @@ def feature_engineering_pipeline(path):
 
 path = "../data/Reviews.csv"
 df = feature_engineering_pipeline(path)
-df.to_pickle("..data/feature_engineered_reviews.pkl")
+df.to_pickle("../data/feature_engineered_reviews.pkl")
+
+with open("../data/feature_engineered_reviews.pkl", "rb") as f:
+    obj = pickle.load(f)
+
+print(obj)
 
 

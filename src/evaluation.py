@@ -12,6 +12,10 @@ from sklearn.metrics.pairwise import cosine_similarity
 import os
 import logging
 
+df = pd.read_pickle("../data/feature_engineered_reviews.pkl")
+print(df.columns)
+print(df.head())
+
 # Try UMAP, but fall back to TSNE if not available
 try:
     import umap
@@ -111,6 +115,64 @@ def evaluate_model_ratings(pred_ratings_df, ratings_truth_df):
     return rmse(merged['rating'], merged['pred_rating'])
 
 def evaluate_model_ranking(scores_df, ratings_truth_df, K_list=[5,10], relevance_threshold=4.0):
+
+    # Convert to sets of ground truth items per user
+    truth = (ratings_truth_df[ratings_truth_df['rating'] >= relevance_threshold]
+             .groupby('user_id')['item_id'].apply(set))
+
+    # Top-K per user (scores_df is already user,item,score)
+    pred = (scores_df.sort_values(['user_id','score'], ascending=[True, False])
+            .groupby('user_id')['item_id'].apply(list))
+
+    results = {}
+
+    for K in K_list:
+        prec_list = []
+        rec_list = []
+        f1_list = []
+
+        for user in truth.index:
+            gt_items = truth[user]
+
+            # user may not exist in predictions
+            if user not in pred.index:
+                continue
+
+            # take unique ranked top-K
+            recommended = pred[user][:K]
+            recommended = list(dict.fromkeys(recommended))  # dedupe preserving order
+
+            hit = len(set(recommended) & gt_items)
+
+            if K > 0:
+                precision = hit / K
+            else:
+                precision = 0.0
+
+            if len(gt_items) > 0:
+                recall = hit / len(gt_items)
+            else:
+                recall = 0.0
+
+            if precision+recall > 0:
+                f1 = 2*precision*recall / (precision+recall)
+            else:
+                f1 = 0.0
+
+            prec_list.append(precision)
+            rec_list.append(recall)
+            f1_list.append(f1)
+
+        results[K] = {
+            'precision': float(np.mean(prec_list)),
+            'recall': float(np.mean(rec_list)),
+            'f1': float(np.mean(f1_list))
+        }
+
+    return results
+
+'''
+def evaluate_model_ranking(scores_df, ratings_truth_df, K_list=[5,10], relevance_threshold=4.0):
     """
     scores_df: DataFrame ['user_id','item_id','score'] produced by model (higher = more likely relevant)
     ratings_truth_df: DataFrame ['user_id','item_id','rating']
@@ -132,6 +194,7 @@ def evaluate_model_ranking(scores_df, ratings_truth_df, K_list=[5,10], relevance
         p, r, f = precision_recall_f1_at_k(recs_k, relevant, K)
         results[K] = {'precision': p, 'recall': r, 'f1': f}
     return results
+'''
 
 # -----------------------------
 # Visualization helpers
@@ -231,7 +294,7 @@ def load_review_embeddings(emb_path, feats_pkl_path):
     if not os.path.exists(emb_path):
         logging.warning(f"Embeddings file not found at {emb_path}. Skipping embedding-based features.")
         return df, None
-    embs = np.load(emb_path)
+    embs = np.load(emb_path, mmap_mode='r')
     if len(embs) != len(df):
         logging.warning("Embeddings length != feature dataframe length. Attempting to proceed but check alignment.")
     return df, embs
@@ -363,12 +426,45 @@ def evaluate_hybrid_from_files(feature_pkl='../data/feature_engineered_reviews.p
     ratings_truth_df = None
     if ratings_truth_csv and os.path.exists(ratings_truth_csv):
         ratings_truth_df = pd.read_csv(ratings_truth_csv)
-    elif ratings_truth_csv:
-        logging.warning("ratings_truth_csv path provided but not found. Skipping RMSE and relevance-based evaluation.")
+    
+    # ---------------------------------------------
+    # Load feature dataframe first + rename columns
+    # ---------------------------------------------
+    df = pd.read_pickle(feature_pkl)
+    df = df.rename(columns={
+        "userId": "user_id",
+        "productId": "item_id"
+    })
+
+    # ---------------------------------------------
+    # Load ratings truth fallback safely
+    # ---------------------------------------------
+    if ratings_truth_csv and os.path.exists(ratings_truth_csv):
+        ratings_truth_df = pd.read_csv(ratings_truth_csv)
+    else:
+        logging.warning("Ratings CSV missing: using dataframe ground truth instead.")
+        ratings_truth_df = df[['user_id','item_id','rating']].copy()
+
+    
+    '''
+    if ratings_truth_csv is None or not os.path.exists(ratings_truth_csv):
+        logging.warning("Ratings CSV missing: using dataframe ground truth instead.")
+        ratings_truth_df = df[['user_id','item_id','rating']].copy()
+        #df = df.rename(columns={"userId": "user_id", "productId": "item_id"})
+    else:
+        ratings_truth_df = pd.read_csv(ratings_truth_csv)
+        #df = df.rename(columns={"userId": "user_id", "productId": "item_id"})
+    '''
 
     # 1) load feature engineered reviews + embeddings
     try:
         df_reviews, review_embs = load_review_embeddings(review_emb_npy, feature_pkl)
+        df_reviews = df_reviews.rename(
+            columns={
+                "userId": "user_id",
+                "productId": "item_id"
+            }
+        )
         logging.info("Loaded feature-engineered reviews and embeddings.")
     except Exception as e:
         logging.warning(f"Failed to load reviews/embeddings: {e}")
@@ -396,117 +492,129 @@ def evaluate_hybrid_from_files(feature_pkl='../data/feature_engineered_reviews.p
         logging.info("No svm_predictions.csv found; skipping SVM component.")
 
     # try to load ncf scores
+    # ======================
+    # Load NCF grouped format
+    # ======================
     ncf_df = None
     if ncf_csv and os.path.exists(ncf_csv):
-        try:
-            ncf_df = pd.read_csv(ncf_csv)
-            if 'score' not in ncf_df.columns and 'pred_rating' in ncf_df.columns:
-                ncf_df['score'] = ncf_df['pred_rating'].astype(float)
-            logging.info(f"Loaded NCF scores from {ncf_csv}.")
-            pairs.append(ncf_df[['user_id','item_id']])
-        except Exception as e:
-            logging.warning(f"Failed to load NCF CSV: {e}")
-            ncf_df = None
+        tmp = pd.read_csv(ncf_csv)
+
+        if 'recommended_product_ids' in tmp.columns and 'scores' in tmp.columns:
+            logging.info("Detected grouped NCF recommendations format")
+
+            def explode_row(row):
+                user = row['user_id']
+                items = row['recommended_product_ids'].split(',')
+                scores = [float(x) for x in row['scores'].split(',')]
+                return pd.DataFrame({
+                    'user_id': [user] * len(items),
+                    'item_id': items,
+                    'score': scores
+                })
+
+            ncf_df = pd.concat(
+                [explode_row(r) for _, r in tmp.iterrows()],
+                ignore_index=True
+            )
+
+            logging.info(f"NCF exploded → {len(ncf_df)} rows")
+
+        else:
+            ncf_df = tmp
+
+        # only keep expected columns
+        ncf_df = ncf_df[['user_id', 'item_id', 'score']]
+
     else:
-        logging.info("No ncf_scores.csv found; skipping NCF component (if you have a .pth model, you'll need to produce score CSV).")
+        logging.info("No NCF CSV found.")
+        ncf_df = None
+    # -------------------------------------------------------------------------
+    # Build master user–item pairs for evaluation
+    # -------------------------------------------------------------------------
+    
+    pairs = []
+    if svm_df is not None:
+        pairs.append(svm_df[['user_id','item_id']])
+    if ncf_df is not None:
+        pairs.append(ncf_df[['user_id','item_id']])
 
-    # include ground truth pairs if present
-    if ratings_truth_df is not None:
-        pairs.append(ratings_truth_df[['user_id','item_id']])
+    # DO NOT add ratings into candidate pool!
+    master_pairs = pd.concat(pairs).drop_duplicates()
 
-    # build master pairs df (unique)
-    if len(pairs) == 0:
-        raise ValueError("No user-item pairs found from SVM/NCF/truth. Provide at least one of svm_predictions.csv, ncf_scores.csv, or ratings_truth_csv.")
-    master_pairs = pd.concat(pairs, ignore_index=True).drop_duplicates().reset_index(drop=True)
-
-    # compute content similarity if embeddings available
+    # -------------------------------------------------------------------------
+    # Compute optional content score (0-1 normalized)
+    # -------------------------------------------------------------------------
     user_content_emb, item_content_emb = {}, {}
-    content_scores_df = None
+
     if df_reviews is not None and review_embs is not None:
-        user_content_emb, item_content_emb = build_user_item_content_embeddings(df_reviews, review_embs)
-        content_scores_df = compute_content_similarity_scores(master_pairs[['user_id','item_id']].copy(),
-                                                             user_content_emb, item_content_emb)
-        # normalize content similarity (-1..1) -> [0,1]
-        if content_scores_df is not None:
-            # fill NaN with 0
-            content_scores_df['content_score_raw'] = content_scores_df['content_score_raw'].fillna(0.0)
-            # map -1..1 -> 0..1
-            content_scores_df['content_score'] = (content_scores_df['content_score_raw'] + 1.0) / 2.0
-            master_pairs = master_pairs.merge(content_scores_df[['content_score']], left_index=True, right_index=True)
+        user_emb, item_emb = build_user_item_content_embeddings(df_reviews, review_embs)
+        content = compute_content_similarity_scores(master_pairs[['user_id','item_id']].copy(),
+                                                    user_emb, item_emb)
+        content['content_score'] = (content['content_score_raw'].fillna(0)+1)/2.0
+        master_pairs = master_pairs.merge(content[['content_score']],
+                                          left_index=True,right_index=True)
     else:
         master_pairs['content_score'] = np.nan
 
-    # attach SVM scores to master_pairs
+    # -------------------------------------------------------------------------
+    # Attach SVM scores
+    # -------------------------------------------------------------------------
     if svm_df is not None:
-        tmp = svm_df[['user_id','item_id','prob_positive']].copy()
-        tmp = tmp.rename(columns={'prob_positive':'svm_score_raw'})
-        master_pairs = master_pairs.merge(tmp, on=['user_id','item_id'], how='left')
-        master_pairs['svm_score_raw'] = master_pairs['svm_score_raw'].fillna(master_pairs['svm_score_raw'].mean() if 'svm_score_raw' in master_pairs.columns else 0.0)
+        t = svm_df.rename(columns={'prob_positive':'svm_raw'})[['user_id','item_id','svm_raw']]
+        master_pairs = master_pairs.merge(t, on=['user_id','item_id'], how='left')
+        master_pairs['svm_raw'] = master_pairs['svm_raw'].fillna(0)
     else:
-        master_pairs['svm_score_raw'] = np.nan
+        master_pairs['svm_raw'] = np.nan
 
-    # attach NCF scores
+    # -------------------------------------------------------------------------
+    # Attach NCF scores
+    # -------------------------------------------------------------------------
     if ncf_df is not None:
-        tmp = ncf_df[['user_id','item_id','score']].copy().rename(columns={'score':'ncf_score_raw'})
-        master_pairs = master_pairs.merge(tmp, on=['user_id','item_id'], how='left')
-        master_pairs['ncf_score_raw'] = master_pairs['ncf_score_raw'].fillna(master_pairs['ncf_score_raw'].mean() if 'ncf_score_raw' in master_pairs.columns else 0.0)
+        t = ncf_df.rename(columns={'score':'ncf_raw'})[['user_id','item_id','ncf_raw']]
+        master_pairs = master_pairs.merge(t, on=['user_id','item_id'], how='left')
+        master_pairs['ncf_raw'] = master_pairs['ncf_raw'].fillna(0)
     else:
-        master_pairs['ncf_score_raw'] = np.nan
+        master_pairs['ncf_raw'] = np.nan
 
-    # Normalize each component to [0,1]
-    master_pairs = normalize_scores(master_pairs, 'svm_score_raw', method='global')
-    master_pairs = normalize_scores(master_pairs, 'ncf_score_raw', method='global')
-    # content_score is already in 0..1 if computed; ensure normalized column exists
-    if 'content_score' in master_pairs.columns:
-        master_pairs['content_score_norm'] = master_pairs['content_score'].fillna(master_pairs['content_score'].mean())
-    else:
-        master_pairs['content_score_norm'] = np.nan
+    # -------------------------------------------------------------------------
+    # NORMALIZE each model ONCE (global min-max)
+    # -------------------------------------------------------------------------
+    for col in ['svm_raw','ncf_raw','content_score']:
+        if master_pairs[col].notna().any():
+            cmin, cmax = master_pairs[col].min(), master_pairs[col].max()
+            if cmax > cmin:
+                master_pairs[col+'_norm'] = (master_pairs[col] - cmin)/(cmax-cmin)
+            else:
+                master_pairs[col+'_norm'] = 0.0
+        else:
+            master_pairs[col+'_norm'] = 0.0
 
-    # Decide weights (defaults: more weight to NCF, moderate to SVM, some to content)
-    default_weights = {'ncf_score_raw_norm': 0.5, 'svm_score_raw_norm': 0.3, 'content_score_norm': 0.2}
+    # -------------------------------------------------------------------------
+    # Resolve weights + fuse scores
+    # -------------------------------------------------------------------------
+    default_weights = {
+        'ncf_raw_norm': 0.5,
+        'svm_raw_norm': 0.3,
+        'content_score_norm': 0.2
+    }
+
     if weights is None:
         weights = default_weights
-    else:
-        # map friendly keys if user passed short names
-        mapped = {}
-        for k,v in weights.items():
-            if k.lower() in ('ncf','ncf_score','ncf_score_raw'):
-                mapped['ncf_score_raw_norm'] = v
-            elif k.lower() in ('svm','svm_score','svm_score_raw'):
-                mapped['svm_score_raw_norm'] = v
-            elif k.lower() in ('content','bert','content_score'):
-                mapped['content_score_norm'] = v
-            else:
-                # assume they passed normalized column name already
-                mapped[k] = v
-        weights = mapped
 
-    # Ensure normalized column names exist: create names used in mapping above
-    # Our normalize_scores created 'svm_score_raw_norm' and 'ncf_score_raw_norm'
-    # If not present, try to use existing 'svm_score_raw_norm' else map from 'svm_score_raw_norm' fallback
-    # (normalize_scores already created *_norm columns)
-    # Fuse
-    score_cols_weights = {col: w for col,w in weights.items() if col in master_pairs.columns}
-    # If user provided non-normalized keys, check for variants
-    if len(score_cols_weights) == 0:
-        # fallback try common names
-        candidates = {}
-        if 'ncf_score_raw_norm' in master_pairs.columns:
-            candidates['ncf_score_raw_norm'] = weights.get('ncf_score_raw_norm', default_weights.get('ncf_score_raw_norm', 0.5))
-        if 'svm_score_raw_norm' in master_pairs.columns:
-            candidates['svm_score_raw_norm'] = weights.get('svm_score_raw_norm', default_weights.get('svm_score_raw_norm', 0.3))
-        if 'content_score_norm' in master_pairs.columns:
-            candidates['content_score_norm'] = weights.get('content_score_norm', default_weights.get('content_score_norm', 0.2))
-        score_cols_weights = candidates
+    # only keep valid columns
+    weights = {k:v for k,v in weights.items() if k in master_pairs.columns}
 
-    # If still empty, pick whatever normalized columns exist
-    if len(score_cols_weights) == 0:
-        for c in ['ncf_score_raw_norm','svm_score_raw_norm','content_score_norm']:
-            if c in master_pairs.columns:
-                score_cols_weights[c] = 1.0
+    # renormalize weights
+    tot = sum(weights.values())
+    weights = {k: v/tot for k,v in weights.items()}
 
-    # fuse
-    master_pairs = fuse_scores(master_pairs, score_cols_weights)
+    # final hybrid score
+    master_pairs['hybrid_score'] = 0
+    for col, w in weights.items():
+        master_pairs['hybrid_score'] += master_pairs[col]*w
+
+    hybrid_scores_df = master_pairs[['user_id','item_id','hybrid_score']]\
+                            .rename(columns={'hybrid_score':'score'})
 
     # Prepare outputs for ranking evaluation: DataFrame with columns user_id,item_id,score
     hybrid_scores_df = master_pairs[['user_id','item_id','hybrid_score']].copy().rename(columns={'hybrid_score':'score'})
@@ -530,6 +638,7 @@ def evaluate_hybrid_from_files(feature_pkl='../data/feature_engineered_reviews.p
     # Save outputs
     hybrid_scores_df.to_csv(os.path.join(output_dir, 'hybrid_scores.csv'), index=False)
     master_pairs.to_csv(os.path.join(output_dir, 'hybrid_components_and_scores.csv'), index=False)
+    
 
     # Summarize into DataFrame
     summary_rows = []
@@ -627,7 +736,7 @@ if __name__ == "__main__":
     feature_pkl = '../data/feature_engineered_reviews.pkl'
     review_emb_npy = '../data/review_embeddings.npy'
     svm_csv = 'svm_predictions.csv'           # should contain user_id,item_id,prob_positive (or pred_label)
-    ncf_csv = 'ncf_scores.csv'               # should contain user_id,item_id,score (or pred_rating)
+    ncf_csv = '../data/all_user_recommendations_grouped.csv'               # should contain user_id,item_id,score (or pred_rating)
     ratings_truth_csv = 'test_ratings.csv'   # optional: for RMSE and relevance-based ranking
 
     # custom weights (optional); if omitted default will be used

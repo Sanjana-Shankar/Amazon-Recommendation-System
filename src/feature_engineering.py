@@ -218,13 +218,13 @@ def feature_engineering_pipeline(path):
         df = run_bert_embeddings(
             df,
             text_col="reviewText",
-            out_path="../data/review_embeddings_bert.npy",
+            out_path="../data/review_embeddings_bert.memmap",
             model_name="bert-base-uncased",
             chunk_size=5000,
             batch_size=64,
             pooling="mean",
             normalize=True,
-            overwrite=False,
+            overwrite=True,
             save_mapping=True,
         )
 
@@ -246,5 +246,6 @@ with open("../data/feature_engineered_reviews.pkl", "rb") as f:
     obj = pickle.load(f)
 
 print(obj)
+
 
 

@@ -1,4 +1,508 @@
 # ncf_model.py
+
+# ncf_model.py (fixed)
+import os
+import pickle
+from typing import List, Tuple, Dict, Optional, Any
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import roc_auc_score, accuracy_score
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, random_split
+from tqdm import tqdm
+import time
+
+# ----------------------
+# CONFIG
+# ----------------------
+FEATURE_PKL = "../data/feature_engineered_reviews.pkl"  # From feature_engineering pipeline
+# This can be either:
+# - "../data/review_embeddings_bert.npy"  (single matrix)
+# - "../data/review_embeddings_bert_mapping.pkl" (mapping -> file + index)
+EMBEDDING_SOURCE = "../data/review_embeddings_bert.memmap"
+MODEL_OUT = "../models/ncf_model.pth"
+ENCODERS_OUT = "../models/encoders.pkl"
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+EMBED_DIM_USER = 64
+EMBED_DIM_ITEM = 64
+HIDDEN_DIMS = [128, 64]
+BATCH_SIZE = 1024
+EPOCHS = 10
+LR = 1e-3
+WEIGHT_DECAY = 1e-6
+TOP_K = 10
+RANDOM_SEED = 42
+
+torch.manual_seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
+
+
+# ----------------------
+# EmbeddingStore abstraction
+# ----------------------
+class EmbeddingStore:
+    """
+    Abstraction to access embeddings by integer row index.
+    Supports:
+      - single memmap array (memmapped)
+      - mapping.pkl with columns: 'bert_embedding_file' and 'embedding_index'
+    """
+
+    def __init__(self, source_path: str, n_rows=None):
+        self.source_path = source_path
+        self._is_single_array = False
+        self._single_array: Optional[np.ndarray] = None
+        self._mapping: Optional[pd.DataFrame] = None
+        self._open_files: Dict[str, Any] = {}  # file_path -> memmap/np.ndarray
+        self._n_rows = n_rows
+        self._dim = None
+
+        if source_path.endswith("_mapping.pkl"):
+            # Mapping mode
+            self._mapping = pd.read_pickle(source_path)
+            if not {"bert_embedding_file", "embedding_index"}.issubset(self._mapping.columns):
+                raise KeyError("Mapping pickle must contain required columns")
+
+            self._n_rows = len(self._mapping)
+
+        elif source_path.endswith(".memmap"):
+            # load feature-engineered dataframe length to infer shape
+            # (you already know the mapping length == n)
+            n = self._n_rows
+
+            # we infer dim by dividing file size by n
+            file_size = os.path.getsize(source_path)
+            emb_dim = file_size // (n * 4)  # float32 = 4 bytes
+
+            self._single_array = np.memmap(
+                source_path,
+                dtype="float32",
+                mode="r",
+                shape=(n, emb_dim)
+            )
+
+            self._is_single_array = True
+            self._dim = emb_dim
+
+        else:
+            # Normal .npy file mode
+            if not os.path.exists(source_path):
+                raise FileNotFoundError(f"Embeddings file not found: {source_path}")
+            try:
+                arr = np.load(source_path, mmap_mode="r")
+            except Exception:
+                arr = np.load(source_path, allow_pickle=True)
+                if arr.dtype == object:
+                    arr = np.vstack(arr).astype(np.float32)
+
+            if isinstance(arr, np.memmap):
+                self._single_array = arr
+            else:
+                self._single_array = np.asarray(arr, dtype=np.float32)
+
+            self._is_single_array = True
+            self._n_rows = arr.shape[0]
+            self._dim = arr.shape[1]
+
+    def __len__(self):
+        return int(self._n_rows)
+
+    @property
+    def dim(self) -> int:
+        if self._dim is not None:
+            return self._dim
+        # infer from mapping by probing first referenced file
+        if self._mapping is not None and len(self._mapping) > 0:
+            sample_row = self._mapping.iloc[0]
+            file_path = sample_row["bert_embedding_file"]
+            idx = int(sample_row["embedding_index"])
+            arr = self._open_or_load_file(file_path)
+            self._dim = int(arr.shape[1])
+            return self._dim
+        raise RuntimeError("Cannot infer embedding dimension (no data)")
+
+    def _open_or_load_file(self, file_path: str) -> np.ndarray:
+        if file_path in self._open_files:
+            return self._open_files[file_path]
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Referenced embedding file does not exist: {file_path}")
+        try:
+            arr = np.load(file_path, mmap_mode="r")
+        except Exception:
+            arr = np.load(file_path, allow_pickle=True)
+            if arr.dtype == object:
+                arr = np.vstack(arr).astype(np.float32)
+        self._open_files[file_path] = arr
+        return arr
+
+    def get(self, idx: int) -> np.ndarray:
+        """
+        Return embedding vector for row idx as 1-D float32 numpy array.
+        """
+        if idx < 0 or idx >= self._n_rows:
+            raise IndexError(f"Index out of range: {idx}")
+        if self._is_single_array:
+            return np.asarray(self._single_array[idx], dtype=np.float32)
+        # mapping mode
+        row = self._mapping.iloc[idx]
+        file_path = row["bert_embedding_file"]
+        emb_index = int(row["embedding_index"])
+        arr = self._open_or_load_file(file_path)
+        return np.asarray(arr[emb_index], dtype=np.float32)
+
+    def get_many(self, indices: List[int]) -> np.ndarray:
+        """
+        Return stacked embeddings for indices as shape (len(indices), dim).
+        """
+        if self._is_single_array:
+            return np.asarray(self._single_array[indices], dtype=np.float32)
+        # For mapping mode we may have multiple files; group by file for efficiency
+        df = self._mapping.iloc[indices].reset_index(drop=True)
+        # group by file_path
+        groups = df.groupby("bert_embedding_file")
+        out_list = [None] * len(indices)
+        # mapping from row position -> value
+        pos = 0
+        # We'll build output in original order
+        output = np.zeros((len(indices), self.dim), dtype=np.float32)
+        for i, (_, r) in enumerate(df.iterrows()):
+            file_path = r["bert_embedding_file"]
+            emb_idx = int(r["embedding_index"])
+            arr = self._open_or_load_file(file_path)
+            output[i] = arr[emb_idx]
+        return output
+
+
+# ----------------------
+# Utilities
+# ----------------------
+def load_feature_engineered_data(feature_pkl_path: str) -> pd.DataFrame:
+    if not os.path.exists(feature_pkl_path):
+        raise FileNotFoundError(f"Feature file not found: {feature_pkl_path}")
+    with open(feature_pkl_path, "rb") as f:
+        df = pickle.load(f)
+    required_cols = ["userId", "productId", "rating", "reviewText", "bert_embedding_file"]
+    for c in required_cols:
+        if c not in df.columns:
+            raise KeyError(f"Expected column '{c}' in feature file")
+    return df.reset_index(drop=True)
+
+
+# ----------------------
+# Dataset
+# ----------------------
+class ReviewDataset(Dataset):
+    def __init__(self, df: pd.DataFrame, emb_store: EmbeddingStore, user_encoder: LabelEncoder, item_encoder: LabelEncoder):
+        """
+        df: rows correspond to embedding mapping ordering (embedding store must align)
+        emb_store: EmbeddingStore instance
+        """
+        if len(df) != len(emb_store):
+            raise AssertionError(f"Dataframe length ({len(df)}) must match embedding rows ({len(emb_store)})")
+        self.df = df.copy().reset_index(drop=True)
+        self.emb_store = emb_store
+        self.user_encoder = user_encoder
+        self.item_encoder = item_encoder
+
+        self.df["label"] = (self.df["rating"] >= 4).astype("float32")
+        if "sentiment_review" not in self.df.columns:
+            self.df["sentiment_review"] = 0.0
+
+        # Precompute encoded indices
+        self.user_idx = user_encoder.transform(self.df["userId"].astype(str))
+        self.item_idx = item_encoder.transform(self.df["productId"].astype(str))
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        u = int(self.user_idx[idx])
+        i = int(self.item_idx[idx])
+        emb = self.emb_store.get(idx)  # returns 1-d float32 numpy array
+        sentiment = float(self.df.loc[idx, "sentiment_review"])
+        label = float(self.df.loc[idx, "label"])
+        return {"user": u, "item": i, "emb": emb, "sentiment": sentiment, "label": label}
+
+
+# ----------------------
+# Model and training utilities (unchanged but using float embeddings)
+# ----------------------
+class NCFModel(nn.Module):
+    def __init__(self,
+                 n_users: int,
+                 n_items: int,
+                 emb_dim_user: int,
+                 emb_dim_item: int,
+                 review_emb_dim: int,
+                 hidden_dims: List[int]):
+        super().__init__()
+        self.user_emb = nn.Embedding(n_users, emb_dim_user)
+        self.item_emb = nn.Embedding(n_items, emb_dim_item)
+
+        review_in = review_emb_dim + 1
+        self.review_mlp = nn.Sequential(
+            nn.Linear(review_in, hidden_dims[0]),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dims[0], hidden_dims[1]),
+            nn.ReLU()
+        )
+
+        review_in2 = emb_dim_user + emb_dim_item + hidden_dims[1]
+        self.comb_mlp = nn.Sequential(
+            nn.Linear(review_in2, hidden_dims[0]),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dims[0], hidden_dims[1]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[1], 1)
+        )
+
+    def forward(self, user_idx, item_idx, review_emb, sentiment):
+        u = self.user_emb(user_idx)
+        v = self.item_emb(item_idx)
+        x = torch.cat([review_emb, sentiment.unsqueeze(1)], dim=1)
+        r = self.review_mlp(x)
+        combined = torch.cat([u, v, r], dim=1)
+        out = self.comb_mlp(combined).squeeze(1)
+        return out
+
+
+def collate_fn(batch):
+    users = torch.tensor([b["user"] for b in batch], dtype=torch.long)
+    items = torch.tensor([b["item"] for b in batch], dtype=torch.long)
+    #embs = torch.tensor([b["emb"] for b in batch], dtype=torch.float32)  # float32 embeddings
+    embs = torch.from_numpy(np.stack([b["emb"] for b in batch])).float()
+    sentiments = torch.tensor([b["sentiment"] for b in batch], dtype=torch.float32)
+    labels = torch.tensor([b["label"] for b in batch], dtype=torch.float32)
+    return users, items, embs, sentiments, labels
+
+
+def train_one_epoch(model, loader, opt, criterion):
+    model.train()
+    running_loss = 0.0
+    for users, items, embs, sentiments, labels in loader:
+        users = users.to(DEVICE)
+        items = items.to(DEVICE)
+        embs = embs.to(DEVICE)
+        sentiments = sentiments.to(DEVICE)
+        labels = labels.to(DEVICE)
+
+        logits = model(users, items, embs, sentiments)
+        loss = criterion(logits, labels)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        running_loss += loss.item() * users.size(0)
+    return running_loss / len(loader.dataset)
+
+
+@torch.no_grad()
+def evaluate(model, loader):
+    model.eval()
+    preds = []
+    truths = []
+    for users, items, embs, sentiments, labels in loader:
+        users = users.to(DEVICE)
+        items = items.to(DEVICE)
+        embs = embs.to(DEVICE)
+        sentiments = sentiments.to(DEVICE)
+        logits = model(users, items, embs, sentiments)
+        probs = torch.sigmoid(logits).cpu().numpy()
+        preds.append(probs)
+        truths.append(labels.numpy())
+    preds = np.concatenate(preds)
+    truths = np.concatenate(truths)
+    auc = roc_auc_score(truths, preds) if len(np.unique(truths)) > 1 else float("nan")
+    pred_labels = (preds >= 0.5).astype(int)
+    acc = accuracy_score(truths, pred_labels)
+    return {"auc": auc, "accuracy": acc, "preds": preds, "truths": truths}
+
+
+@torch.no_grad()
+def recommend_for_user(model: nn.Module,
+                       user_encoded: int,
+                       all_item_indices: np.ndarray,
+                       itemid_by_index: Dict[int, str],
+                       user_interacted_items: set,
+                       review_embs_for_user_placeholder: np.ndarray,
+                       sentiment_placeholder: float,
+                       top_k: int = 10) -> List[Tuple[str, float]]:
+    model.eval()
+    n_items = len(all_item_indices)
+    batch_size = 2048
+    scores = []
+    device = DEVICE
+    user_idx_tensor = torch.tensor([user_encoded], dtype=torch.long, device=device)
+
+    for start in range(0, n_items, batch_size):
+        end = min(n_items, start + batch_size)
+        item_batch = torch.arange(start, end, dtype=torch.long, device=device)
+        user_batch = user_idx_tensor.repeat(end - start)
+        emb_batch = torch.tensor(
+            np.repeat(review_embs_for_user_placeholder[np.newaxis, :], end - start, axis=0),
+            dtype=torch.float32,
+            device=device
+        )
+        sentiment_batch = torch.tensor(
+            np.repeat([sentiment_placeholder], end - start),
+            dtype=torch.float32,
+            device=device
+        )
+        with torch.no_grad():
+            logits = model(user_batch, item_batch, emb_batch, sentiment_batch)
+        probs = torch.sigmoid(logits).cpu().numpy()
+        scores.append(probs)
+
+    scores = np.concatenate(scores)
+    ranked_idx = np.argsort(-scores)
+    results = []
+    for idx in ranked_idx:
+        item_index = all_item_indices[idx]
+        if item_index in user_interacted_items:
+            continue
+        itemid = itemid_by_index[int(item_index)]
+        results.append((itemid, float(scores[idx])))
+        if len(results) >= top_k:
+            break
+    return results
+
+
+# ----------------------
+# Main
+# ----------------------
+def main():
+    print("Loading feature-engineered data from:", FEATURE_PKL)
+    df = load_feature_engineered_data(FEATURE_PKL)
+
+    print("Opening embeddings source:", EMBEDDING_SOURCE)
+    emb_store = EmbeddingStore(EMBEDDING_SOURCE, n_rows=len(df))
+    review_emb_dim = emb_store.dim
+    print("Embedding store rows:", len(emb_store), "dim:", review_emb_dim)
+
+    if len(df) != len(emb_store):
+        raise RuntimeError(f"DF rows ({len(df)}) != embedding rows ({len(emb_store)}). Please regenerate embeddings to match DF ordering.")
+
+    # Encoders
+    df["userId"] = df["userId"].astype(str)
+    df["productId"] = df["productId"].astype(str)
+    user_encoder = LabelEncoder(); user_encoder.fit(df["userId"])
+    item_encoder = LabelEncoder(); item_encoder.fit(df["productId"])
+
+    n_users = len(user_encoder.classes_)
+    n_items = df["productId"].nunique()
+    print(f"n_users={n_users}, n_items={n_items}, review_emb_dim={review_emb_dim}")
+
+    dataset = ReviewDataset(df, emb_store, user_encoder, item_encoder)
+
+    print("After initializing ReviewDataset")
+
+    val_frac = 0.1
+    n_val = int(len(dataset) * val_frac)
+    n_train = len(dataset) - n_val
+    train_ds, val_ds = random_split(dataset, [n_train, n_val])
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+
+    print("Just before initializing NCF Model")
+
+    model = NCFModel(
+        n_users=n_users,
+        n_items=n_items,
+        emb_dim_user=EMBED_DIM_USER,
+        emb_dim_item=EMBED_DIM_ITEM,
+        review_emb_dim=review_emb_dim,
+        hidden_dims=HIDDEN_DIMS
+    ).to(DEVICE)
+
+    print("Just after initializing NCF Model")
+
+    opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    criterion = nn.BCEWithLogitsLoss()
+
+    print("Just before entering into training loop")
+
+    best_val_auc = -1.0
+    for epoch in range(1, EPOCHS + 1):
+        print("Going to train one epoch")
+        train_loss = train_one_epoch(model, train_loader, opt, criterion)
+        print("After training one epoch")
+        metrics = evaluate(model, val_loader)
+        print("After evaluating")
+        val_auc = metrics["auc"]
+        val_acc = metrics["accuracy"]
+        print(f"Epoch {epoch:02d} | train_loss={train_loss:.4f} | val_auc={val_auc:.4f} | val_acc={val_acc:.4f}")
+        if not np.isnan(val_auc) and val_auc > best_val_auc:
+            best_val_auc = val_auc
+            os.makedirs(os.path.dirname(MODEL_OUT), exist_ok=True)
+            torch.save(model.state_dict(), MODEL_OUT)
+            with open(ENCODERS_OUT, "wb") as f:
+                pickle.dump({"user_encoder": user_encoder, "item_encoder": item_encoder}, f)
+            print(f"Saved best model to {MODEL_OUT} (val_auc={val_auc:.4f})")
+
+    print("Finished training loop.")
+    # (recommendation generation code unchanged - continues to use `emb_store`)
+
+    # Build itemid_by_index
+    itemid_by_index = {i: item for i, item in enumerate(item_encoder.inverse_transform(np.arange(n_items)))}
+
+    # Build user->item interactions
+    df["u_enc"] = user_encoder.transform(df["userId"].astype(str))
+    df["i_enc"] = item_encoder.transform(df["productId"].astype(str))
+    user_to_items = df.groupby("u_enc")["i_enc"].apply(lambda s: set(s.values)).to_dict()
+
+    # Generate grouped recommendations to CSV
+    print("Generating grouped recommendations for ALL users...")
+    user_rows_out = []
+    output_path = "../data/all_user_recommendations_grouped.csv"
+
+    for u_enc in range(n_users):
+        orig_user_id = user_encoder.classes_[u_enc]
+        user_rows = df.loc[df["userId"] == orig_user_id]
+        if len(user_rows) > 0:
+            idxs = user_rows.index.tolist()
+            user_emb_placeholder = emb_store.get_many(idxs).mean(axis=0)
+            sentiment_placeholder = float(user_rows["sentiment_review"].mean())
+        else:
+            user_emb_placeholder = emb_store.get_many(list(range(len(df)))).mean(axis=0)
+            sentiment_placeholder = float(df["sentiment_review"].mean())
+
+        recs = recommend_for_user(
+            model=model,
+            user_encoded=int(u_enc),
+            all_item_indices=np.arange(n_items),
+            itemid_by_index=itemid_by_index,
+            user_interacted_items=user_to_items.get(int(u_enc), set()),
+            review_embs_for_user_placeholder=user_emb_placeholder,
+            sentiment_placeholder=sentiment_placeholder,
+            top_k=TOP_K
+        )
+
+        product_ids = [pid for pid, _ in recs]
+        scores = [score for _, score in recs]
+        user_rows_out.append({
+            "user_id": orig_user_id,
+            "user_encoded": u_enc,
+            "recommended_product_ids": ",".join(product_ids),
+            "scores": ",".join([f"{s:.6f}" for s in scores])
+        })
+        if (u_enc + 1) % 10000 == 0:
+            print(f"Processed {u_enc + 1}/{n_users} users...")
+
+    output_df = pd.DataFrame(user_rows_out)
+    output_df.to_csv(output_path, index=False)
+    print(f"Saved grouped recommendations to: {output_path}")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
+
+'''
 import os
 import pickle
 from typing import List, Tuple, Dict
@@ -14,11 +518,16 @@ from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 import time
 
+x = np.load("../data/review_embeddings_bert.npy", allow_pickle=True)
+print(x.shape)
+
+#np.load("../data/review_embeddings_bert.npy")
+
 # Neural Collaborative Filtering style recommender 
 
 # CONFIG 
 FEATURE_PKL = "../data/feature_engineered_reviews.pkl" # From feature_engineering pipeline
-EMBEDDING_NPY = "../data/review_embeddings.npy" # From feature_engineering pipeline
+EMBEDDING_NPY = "../data/review_embeddings_bert.npy" # From feature_engineering pipeline
 MODEL_OUT = "../models/ncf_model.pth"
 ENCODERS_OUT = "../models/encoders.pkl"
 
@@ -53,18 +562,24 @@ def load_feature_engineered_data(feature_pkl_path: str) -> pd.DataFrame:
 def load_embeddings(npy_path: str) -> np.ndarray:
     if not os.path.exists(npy_path):
         raise FileNotFoundError(f"Embeddings file not found: {npy_path}")
-    emb = np.load(npy_path)
-    return emb.astype("float32")
+    
+    # load safely. np.load already checks pickle format
+    emb = np.load(npy_path, allow_pickle=True)
+
+    emb = np.vstack(emb).astype(np.float32)
+
+    # convert to plain ndarray if it is list-like
+    return emb
 
 # Builds user/item id mappings
 # Creates a PyTorch dataset that includes user, item, sentiment, and review_embedding 
 class ReviewDataset(Dataset):
     def __init__(self, df: pd.DataFrame, embeddings: np.ndarray, user_encoder: LabelEncoder, item_encoder: LabelEncoder):
-        '''
+    
         df: Feature-engineered DataFrame (rows correspond to embeddings order)
         embeddings: numpy array shape (n_rows, emb_dim)
         Encoders map original IDs to integer indices
-        '''
+        
         assert len(df) == len(embeddings), "Dataframe length must match embeddings length"
 
         self.df = df.copy().reset_index(drop=True)
@@ -151,7 +666,8 @@ def collate_fn(batch):
     # batch is list of dicts
     users = torch.tensor([b["user"] for b in batch], dtype=torch.long)
     items = torch.tensor([b["item"] for b in batch], dtype=torch.long)
-    embs = torch.from_numpy(np.array([b["emb"] for b in batch], dtype=np.float32))
+    #embs = torch.from_numpy(np.array([b["emb"] for b in batch], dtype=np.float32))
+    embs = torch.tensor([b["emb"] for b in batch], dtype=torch.np.float32)
     sentiments = torch.tensor([b["sentiment"] for b in batch], dtype=torch.float32)
     labels = torch.tensor([b["label"] for b in batch], dtype=torch.float32)
     return users, items, embs, sentiments, labels
@@ -206,10 +722,10 @@ def recommend_for_user(model:nn.Module,
                        review_embs_for_user_placeholder: np.ndarray,
                        sentiment_placeholder: float,
                        top_k: int = 10) -> List[Tuple[str, float]]:
-    '''
+    
     Produces top-K item recommendations for a user by scoring all items. Because review embedding 
     is user-review specific, we pass a placeholder review embedding. 
-    '''
+    
     model.eval()
     n_items = len(all_item_indices)
     batch_size = 2048
@@ -387,7 +903,8 @@ def main():
     # Build user -> set(items) interactions to filter out already seen
     
     # Example: produce top-K recommendations for first 5 users
-    '''
+    
+
     print("Generating sample recommendations for first 5 users...")
     sample_users = list(range(min(5, n_users)))
     for u_enc in sample_users:
@@ -418,7 +935,7 @@ def main():
         for pid, score in recs:
             print(f"  {pid} (score={score:.4f})")
         print("-" * 30)
-    '''
+    
     # -------------------------------------------------------------
     # Generate recommendations for EVERY user and save to CSV
     # (ONE ROW PER USER)
@@ -483,6 +1000,4 @@ if __name__ == "__main__":
     main()
 
 # Saves the trained model and encoders 
-
-
-
+'''

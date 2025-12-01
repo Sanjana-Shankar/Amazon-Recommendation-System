@@ -87,7 +87,7 @@ def encode_in_chunks_and_save_bert(
     batch_size: int = 32,
     pooling: str = "mean",
     normalize: bool = True,
-    overwrite: bool = False,
+    overwrite: bool = True,
     device: Optional[str] = None,
 ) -> str:
     """
@@ -153,7 +153,7 @@ def run_bert_embeddings(
     batch_size: int = 32,
     pooling: str = "mean",
     normalize: bool = True,
-    overwrite: bool = False,
+    overwrite: bool = True,
     device: Optional[str] = None,
     save_mapping: bool = True,
 ) -> pd.DataFrame:
@@ -175,9 +175,13 @@ def run_bert_embeddings(
         overwrite=overwrite,
         device=device,
     )
+    # Ensure correct file format for embeddings
+    if out_path.endswith(".npy"):
+        raise ValueError("Use .memmap or .bin for BERT embeddings, not .npy")
 
     df_map = add_embedding_file_and_index(df, out_path)
     if save_mapping:
         map_path = os.path.splitext(out_path)[0] + "_mapping.pkl"
         df_map[["bert_embedding_file", "embedding_index"]].to_pickle(map_path)
     return df_map
+

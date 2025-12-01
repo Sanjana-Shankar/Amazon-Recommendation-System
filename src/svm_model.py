@@ -24,7 +24,8 @@ df = pd.read_pickle(PICKLE_PATH)
 
 # Select features: all BERT dims + numeric metadata + one-hot category columns (if present)
 feature_cols = []
-feature_cols += [c for c in df.columns if c.startswith("bert_")]
+#feature_cols += [c for c in df.columns if c.startswith("bert_")]
+feature_cols = [c for c in df.columns if c.startswith("bert_") and pd.api.types.is_numeric_dtype(df[c])]
 feature_cols += [c for c in ["sentiment_review", "sentiment_summary",
                              "avg_rating_per_product", "num_reviews_per_user",
                              "recency_days", "recent_user_frequency"] if c in df.columns]
@@ -84,3 +85,48 @@ print(confusion_matrix(y_test, y_pred))
 # Save model
 joblib.dump(pipeline, MODEL_OUT)
 print(f"Saved model to {MODEL_OUT}")
+
+print("\nGenerating predictions for entire dataset...")
+
+# Predict for all rows in the dataset (not just test set)
+all_predictions = pipeline.predict(X)
+df["svm_predicted_label"] = all_predictions
+
+# Standardize naming: convert camelCase → snake_case if present
+rename_map = {
+    "productId": "product_id",
+    "userId": "user_id",
+    "Id": "review_id"
+}
+
+df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns}, inplace=True)
+
+# REQUIRED columns
+required = {"user_id", "product_id"}
+missing = required - set(df.columns)
+
+if missing:
+    raise ValueError(f"Missing required columns for evaluation: {missing}")
+
+print("Column validation passed!")
+
+# Create evaluation dataframe
+svm_df = df[["user_id", "product_id"]].copy()
+svm_df.rename(columns={"product_id": "item_id"}, inplace=True)
+svm_df["score"] = all_predictions
+
+OUTPUT_CSV = os.path.join(os.path.dirname(__file__), "svm_predictions.csv")
+svm_df.to_csv(OUTPUT_CSV, index=False)
+
+print(f"[OK] SVM predictions written to: {OUTPUT_CSV}")
+
+# Create output dataframe
+'''
+output_df = df[id_cols + ["svm_predicted_label"]] if id_cols else df[["svm_predicted_label"]]
+
+# Save to CSV
+OUTPUT_CSV = os.path.join(os.path.dirname(__file__), "svm_predictions.csv")
+output_df.to_csv(OUTPUT_CSV, index=False)
+
+print(f"SVM predictions saved to: {OUTPUT_CSV}")
+'''

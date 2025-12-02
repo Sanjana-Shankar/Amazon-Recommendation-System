@@ -6,7 +6,17 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.svm import SVC, LinearSVC
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.metrics import (
+    classification_report, 
+    confusion_matrix, 
+    accuracy_score,
+    roc_curve,
+    auc
+)
+
+import matplotlib.pyplot as plt
+from sklearn.metrics import ConfusionMatrixDisplay
+from sklearn.decomposition import PCA
 
 # CONFIG
 PICKLE_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "feature_engineered_reviews.pkl")   # Path to feature-engineered DataFrame
@@ -130,3 +140,48 @@ output_df.to_csv(OUTPUT_CSV, index=False)
 
 print(f"SVM predictions saved to: {OUTPUT_CSV}")
 '''
+
+# ---- Score distribution on all data ----
+if hasattr(pipeline.named_steps["svm"], "decision_function"):
+    all_scores = pipeline.decision_function(X)
+    plt.figure(figsize=(6, 4))
+    plt.hist(all_scores, bins=50)
+    plt.xlabel("Decision score")
+    plt.ylabel("Count")
+    plt.title("Distribution of SVM Decision Scores (All Data)")
+    plt.tight_layout()
+    plt.savefig("./eval_outputs/svm_score_distribution.png", dpi=150)
+    plt.show()
+    print("Score distribution plot saved to ./eval_outputs/svm_score_distribution.png")
+
+# ---- Confusion Matrix Plot ----
+disp = ConfusionMatrixDisplay(confusion_matrix=confusion_matrix(y_test, y_pred))
+fig, ax = plt.subplots(figsize=(5, 5))
+disp.plot(cmap="Blues", ax=ax, colorbar=False)
+ax.set_title("SVM Confusion Matrix (Test Set)")
+plt.tight_layout()
+plt.savefig("./eval_outputs/svm_confusion_matrix.png", dpi=150)
+plt.show()
+print("Confusion matrix plot saved to ./eval_outputs/svm_confusion_matrix.png")
+
+# ---- ROC Curve Plot (using decision_function) ----
+if hasattr(pipeline.named_steps["svm"], "decision_function"):
+    # Scores for the positive class
+    y_score = pipeline.decision_function(X_test)
+
+    fpr, tpr, _ = roc_curve(y_test, y_score)
+    roc_auc = auc(fpr, tpr)
+
+    plt.figure(figsize=(6, 6))
+    plt.plot(fpr, tpr, label=f"LinearSVC (AUC = {roc_auc:.3f})")
+    plt.plot([0, 1], [0, 1], linestyle="--", label="Random chance")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("SVM ROC Curve (Test Set)")
+    plt.legend(loc="lower right")
+    plt.tight_layout()
+    plt.savefig("./eval_outputs/svm_roc_curve.png", dpi=150)
+    plt.show()
+    print("ROC curve plot saved to ./eval_outputs/svm_roc_curve.png")
+else:
+    print("ROC curve not available: SVM model has no decision_function.")
